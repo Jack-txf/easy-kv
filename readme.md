@@ -4,6 +4,8 @@
 
 地址：https://github.com/Jack-txf/easy-kv
 
+**TIPS**：此文章对应的分支版本是**version0211**
+
 raft基础知识：https://mp.weixin.qq.com/s/DHO2CK87kI-clf4O96t5Cw
 
 # 1. 前言

@@ -208,11 +208,6 @@ public class RaftNode {
     private final int port;      // 本节点端口
 
 
-    // 配置常量--为了测试，我们把时间调长一点儿
-    private static final int MIN_ELECTION_TIMEOUT = 1500; // 选举超时1500-3000ms随机
-    private static final int MAX_ELECTION_TIMEOUT = 3000;
-    private static final int HEARTBEAT_INTERVAL = 500;    // 心跳间隔50ms
-
     // 依赖组件
     // private final LogManager logManager; // 高性能日志管理器
     // private final MemoryStorage storage;

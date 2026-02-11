@@ -1,18 +1,22 @@
-## 简易的分布式kv设计--(一)
+# 简易的分布式kv设计--(一)
 
 **这篇文章目前只设计到集群启动，然后自动选主的功能。**
 
-### 1. 前言
+地址：https://github.com/Jack-txf/easy-kv
+
+raft基础知识：https://mp.weixin.qq.com/s/DHO2CK87kI-clf4O96t5Cw
+
+# 1. 前言
 
 在 Raft KV 系统中，每个节点（Node）都是对等的。一个典型的请求流向是： `Client` -> `Leader Node` -> `Raft 日志同步` -> `大多数节点确认` -> `应用到状态机 (KV Store)` -> `返回 Client`。
 
 
 
-### 2. 设计步骤
+# 2. 设计步骤
 
 Raft 核心组件包括：一致性结点模块，RPC 通信，日志模块。
 
-#### 2.1 日志
+## 2.1 日志
 
 ```txt
 写日志 → 复制日志 → commit → apply 【leader应用顺序】
@@ -335,7 +339,9 @@ public class LogManager {
 
 
 
-#### 2.2 服务端设计
+## 2.2 服务端设计
+
+### 2.2.1 消息设计
 
 日志设计好了之后，接下来看服务端如何设计。我们使用的是netty框架，要求有netty基础。然后序列化协议采用的是protobuf，读者可以参考这篇文章：https://mp.weixin.qq.com/s/kg_-AMHRn_DzFbfBnkK4VQ 这篇文章大致讲解了一下该序列化协议，并且也是采用netty整合的。根据proto文件生成类的命令如下，也可以用idea的插件自动生成。
 
@@ -446,9 +452,120 @@ message AppendEntriesResponse {
 
 接下来看服务端的节点设计，我们从netty服务启动开始往下看：
 
+在kv-core的app包里面
+
 ```java
+public static void main(String[] args) {
+    int port = getPort(args);
+    RaftNettyServer raftNettyServer = new RaftNettyServer(port);
+    try {
+        raftNettyServer.start();
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+    }
+}
+
+private static int getPort(String[] args) {
+    for (String arg : args) {
+        if (arg.startsWith("node.port=")) {
+            return Integer.parseInt(arg.substring(10));
+        }
+    }
+    return 7777;
+}
 ```
 
+从java程序启动的命令行读取结点的端口参数，我们可以用一台电脑开启多个应用，在idea中这样配置就可以了：如下图所示
+
+<img src=".\images\kv2.png" style="zoom: 50%;" />
+
+从上图中可以看到，配置了三个节点，然后本项目的jdk是采用的21这个版本。配置好了之后，在idea的services里面可以把这些配置一起加进去，然后就可以同时启动多个节点了。
+
+### 2.2.2 连接设计
+
+```java
+RaftNettyServer raftNettyServer = new RaftNettyServer(port);
+...
+raftNettyServer.start();
+```
+
+从上一节的启动类看出来主要就是new了一个server对象，然后调用start方法。我们顺着这两个看就可以了。
+
+首先是构造方法：
+
+```java
+public class RaftNettyServer {
+  	....
+    private final int port;
+    private final RaftNode node;
+
+    public RaftNettyServer(int port) {
+        this.port = port;
+         // 这里创建了一个raft结点对象
+        this.node = new RaftNode(port);
+    }
+}
+
+// 这个是RaftNode类，
+public RaftNode(int port) {
+    this.port = port;
+
+    // 从配置文件中找到自己
+    this.nodesConfig = new NodesConfig();
+    this.nodeId = nodesConfig.findSelf(port);
+
+    // 需要把自身结点
+    this.rpcPeers = nodesConfig.getNodeList().stream()
+        // node的格式是'ip:port'
+        .map(node -> new RpcPeer(node, node.split(":")[0],
+                                 Integer.parseInt(node.split(":")[1]), this))
+        .toList();
+
+    this.logManager = new LogManager();
+    this.storage = new MemoryStorage();
+
+    // 把两个时间先初始化咯
+    this.electionTimeout = 8000 + ThreadLocalRandom.current().nextInt(4000);
+    this.lastHeartbeatTime = System.currentTimeMillis();
+    log.info("初始化选举超时：{}", electionTimeout);
+
+    // 定时器
+    scheduler = Executors.newScheduledThreadPool(2);
+    scheduler.scheduleAtFixedRate(this::tick, 2, 2000, TimeUnit.MILLISECONDS);
+}
+```
+
+Raft类是最核心的一个类。上面的构造方法其实很简单。读者自行理解。需要说明一下的就是nodeId的格式：【ip:端口】
+
+```java
+127.0.0.1:8888 // 就是这种字符串的格式
+```
+
+还有要说明的就是rpcPeers这个List的构建，可以看出来先是从配置文件读取到了集群节点列表，然后遍历这个列表创建了对象，这个具体是什么意思呢？先看一下下面的连接示意图：
+
+<img src=".\images\kv3.png" style="zoom:50%;" />
+
+NettyClient不仅仅是给客户用的，集群结点内部互相通信也要用到这个，rpcPeers就是集群节点内部通信使用的。如上图所示，每个节点都有一个NettyServer启动并监听着端口，同时Leader结点需要给所有的Follower结点发送心跳请求，此时这个Leader相当于其他两个Follower结点就相当于Client了，所以在结点一里面有client的部分，在项目归到了rpc的包下，也就是上面那个rpcPeers的由来了。
+
+在集群启动的时候，都是Follower结点，只有等到超时了才会开始选主，在此之前，每个节点都有成为Candidate的可能，也就是说每个节点都有向其他结点发送投票请求的可能（VoteRequest），那么每个节点里面都要有一套Netty Client及处理流程。就如下图所示：
+
+<img src=".\images\kv4.png" style="zoom:50%;" />
+
+这样就有一个问题了，三个节点，我就要六个tcp连接了，四个节点就要12个连接，十个节点呢，就要90个连接，这也太多了吧，那也确实是的。有一个思路是搞一个中间层叫做routeCenter，所有结点连向它，然后消息都经过这个路由中心来转发，这样连接数就会少很多了。
+
+还有一个思路，反正NettyClient + 一个NettyServer构建出一个Channel，理论上我只需要三个tcp连接就可以了啊。如下图所示：
+
+<img src=".\images\kv5.png" style="zoom:50%;" />
+
+但是这样的话，节点间通信需要转发了，代码逻辑就太复杂了，况且还有一个问题，那就是如何确定这个tcp的连接顺序呢？这个可以按照nodeId的字典顺序来嘛。反正就是麻烦就完事儿了。。。
+
+综上所述，还是最开始的方案最简单直接了，反正这就是一个简易的案例，不要考虑太多了。如果有一些其他合适的思路，欢迎读者给出。
+
+节点之间的连接设计就是上面的样子了。
+
+接下来看RaftNode的设计。
+
+### 2.2.3 RaftNode设计
 
 
 
@@ -461,7 +578,10 @@ message AppendEntriesResponse {
 
 
 
-### end. 参考
+
+
+
+# end. 参考
 
 1. http://thinkinjava.cn/2019/01/12/2019/2019-01-12-lu-raft-kv/#%E4%BB%80%E4%B9%88%E6%98%AF-Java-%E7%89%88-Raft-%E5%88%86%E5%B8%83%E5%BC%8F-KV-%E5%AD%98%E5%82%A8
 2. https://github.com/stateIs0/lu-raft-kv

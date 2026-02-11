@@ -1,0 +1,94 @@
+syntax = "proto3";
+option java_outer_classname = "KvRaftProto"; // 生成的外层类名
+option java_multiple_files = false; // 生成多个独立的Java类（而非内部类）
+
+// ===================== 1. 通用消息封装体（核心） =====================
+// Netty传输时只传这个消息，通过type识别具体消息类型
+message RaftKvMessage {
+  // 消息类型枚举（覆盖所有交互场景）
+  enum MessageType {
+    UNKNOWN = 0; // 未知类型（兜底）
+    // 客户端 ↔ 节点：KV操作
+    KV_REQUEST = 1;    // 客户端发起KV请求（PUT/GET/DELETE）
+    KV_RESPONSE = 2;   // 节点响应客户端KV请求
+    // 节点 ↔ 节点：Raft共识
+    VOTE_REQUEST = 3;  // 选举请求（Candidate→Follower）
+    VOTE_RESPONSE = 4; // 选举响应（Follower→Candidate）
+    APPEND_ENTRIES_REQUEST = 5;  // 日志追加/心跳（Leader→Follower）
+    APPEND_ENTRIES_RESPONSE = 6; // 日志追加响应（Follower→Leader）
+  }
+
+  MessageType type = 1; // 消息类型（必传）
+  string node_id = 2;   // 发送方节点ID（用于识别节点）
+
+  // 具体消息体（根据type选择其中一个）
+  KvRequest kv_request = 3;
+  KvResponse kv_response = 4;
+  VoteRequest vote_request = 5;
+  VoteResponse vote_response = 6;
+  AppendEntriesRequest append_entries_request = 7;
+  AppendEntriesResponse append_entries_response = 8;
+}
+
+// ===================== 2. 客户端KV操作相关 =====================
+// 客户端发起的KV请求（PUT/GET/DELETE）
+message KvRequest {
+  enum OpType {
+    PUT = 0;    // 写入/更新
+    GET = 1;    // 读取
+    DELETE = 2; // 删除
+  }
+  OpType op_type = 1; // 操作类型（必传）
+  string key = 2;     // KV的key（必传）
+  string value = 3;   // KV的value（仅PUT时传）
+  // 可选：请求ID，用于幂等性（防止重复请求）
+  string request_id = 4;
+}
+
+// 节点响应客户端的KV结果
+message KvResponse {
+  bool success = 1;    // 操作是否成功
+  string message = 2;  // 错误信息/提示（失败时必传）
+  string value = 3;    // 返回的value（仅GET成功时传）
+  string request_id = 4; // 对应请求的ID（幂等性）
+}
+
+// ===================== 3. Raft选举相关 =====================
+// Candidate向Follower发起的投票请求
+message VoteRequest {
+  int64 term = 1;                // Candidate的当前任期（必传）
+  string candidate_id = 2;       // Candidate的节点ID（必传）
+  int64 last_log_index = 3;      // Candidate最后一条日志的索引（用于日志一致性检查）
+  int64 last_log_term = 4;       // Candidate最后一条日志的任期（用于日志一致性检查）
+}
+
+// Follower响应Candidate的投票结果
+message VoteResponse {
+  int64 term = 1;                // Follower的当前任期（必传，用于更新Candidate的任期）
+  bool vote_granted = 2;         // 是否投赞成票（必传）
+}
+
+// ===================== 4. Raft日志追加/心跳相关 =====================
+// 日志条目（与你设计的日志格式对齐，序列化后可直接写入日志文件）
+message LogEntry {
+  int64 term = 1;        // Raft任期（对应你日志格式的term）
+  int64 index = 2;       // 日志索引（对应你日志格式的index）
+  string command = 3;    // KV操作命令（如"PUT key1 value1"，对应你日志格式的command）
+}
+
+// Leader向Follower发送的日志追加/心跳请求
+message AppendEntriesRequest {
+  int64 term = 1;                // Leader的当前任期（必传）
+  string leader_id = 2;          // Leader的节点ID（必传）
+  int64 prev_log_index = 3;      // 前一条日志的索引（用于日志一致性检查）
+  int64 prev_log_term = 4;       // 前一条日志的任期（用于日志一致性检查）
+  repeated LogEntry entries = 5; // 待追加的日志条目（心跳时为空）
+  int64 leader_commit = 6;       // Leader已提交的日志索引（Follower据此更新自己的提交索引）
+}
+
+// Follower响应Leader的日志追加结果
+message AppendEntriesResponse {
+  int64 term = 1;                // Follower的当前任期（必传，用于更新Leader的任期）
+  bool success = 2;              // 日志追加是否成功（必传）
+  int64 match_index = 3;         // Follower已匹配的日志索引（Leader据此更新nextIndex）
+}

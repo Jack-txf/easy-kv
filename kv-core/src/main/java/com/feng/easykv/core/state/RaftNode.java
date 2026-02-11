@@ -286,7 +286,8 @@ public class RaftNode {
         // 3. 发送投票请求
         // 构建一个对象，表示当前投票请求的状态
         // String voteId = UUID.randomUUID().toString().replaceAll("-", "");
-        // 这里为什么可以用term？因为 Raft 规定，一个节点在一个 term 内只能投一张票。所以，只要 term 匹配，这个响应就一定是针对你当前发起的这一轮选举的。
+        // 这里为什么可以用term？因为 Raft 规定，一个节点在一个 term 内只能投一张票。
+        // 所以，只要 term 匹配，这个响应就一定是针对你当前发起的这一轮选举的。
         GlobalVoteManager.setVoteState(currentTerm.get(), new VoteState(nodeId, currentTerm.get(), majority));
 
         int countSend = 0;

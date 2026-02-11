@@ -543,7 +543,13 @@ Raft类是最核心的一个类。上面的构造方法其实很简单。读者�
 127.0.0.1:8888 // 就是这种字符串的格式
 ```
 
-还有要说明的就是rpcPeers这个List的构建，可以看出来先是从配置文件读取到了集群节点列表，然后遍历这个列表创建了对象，这个具体是什么意思呢？先看一下下面的连接示意图：
+还有要说明的就是rpcPeers这个List的构建，可以看出来先是从配置文件读取到了集群节点列表，然后遍历这个列表创建了对象，这个具体是什么意思呢？
+
+首先看一下Netty的客户端发送请求到服务端，服务端处理后在返回给客户端，客户端根据响应结果进行逻辑处理。这样一个示意图：
+
+<img src=".\images\kv6.png" style="zoom: 50%;" />
+
+再看一下下面的连接示意图：
 
 <img src=".\images\kv3.png" style="zoom:50%;" />
 
@@ -569,19 +575,243 @@ NettyClient不仅仅是给客户用的，集群结点内部互相通信也要用
 
 ### 2.2.3 RaftNode设计
 
+那就从构造器开始看吧：
 
+```java
+public RaftNode(int port) {
+    this.port = port;
 
+    // 从配置文件中找到自己
+    this.nodesConfig = new NodesConfig();
+    this.nodeId = nodesConfig.findSelf(port);
 
+    // 需要把自身结点
+    this.rpcPeers = nodesConfig.getNodeList().stream()
+        // node的格式是'ip:port'
+        .map(node -> new RpcPeer(node, node.split(":")[0],
+                                 Integer.parseInt(node.split(":")[1]), this))
+        .toList();
 
+    this.logManager = new LogManager();
+    this.storage = new MemoryStorage();
 
+    // 把两个时间先初始化咯
+    this.electionTimeout = 8000 + ThreadLocalRandom.current().nextInt(4000);
+    this.lastHeartbeatTime = System.currentTimeMillis();
+    log.info("初始化选举超时：{}", electionTimeout);
 
+    // 定时器
+    scheduler = Executors.newScheduledThreadPool(2);
+    scheduler.scheduleAtFixedRate(this::tick, 2, 2000, TimeUnit.MILLISECONDS);
+}
+```
 
+可以看到都是做一些初始化的工作，然后下面是开启了一个定时任务tick
 
+```java
+private void tick() {
+    log.info("检查是否超时：{} 状态: {}", nodeId, state);
+    try {
+        if (state != NodeState.LEADER && isTimeout()) {
+            becomeCandidate();
+        } else if (state == NodeState.LEADER) {
+            // sendHeartbeats();
+        }
+    } catch ( Exception e ) {
+        log.error("{} 节点tick定时任务异常", nodeId, e);
+    }
+}
+private void becomeCandidate() {
+    log.info("{} 选举超时，转为 Candidate，开始任期: {}", nodeId, currentTerm.get() + 1);
+    state = NodeState.CANDIDATE;
+    currentTerm.getAndIncrement(); // 任期+1
+    votedFor = nodeId; // 给自己投一票
+    resetElectionTimeout();
+    // 集群发送投票请求
+    requestVotes();
+}
+ private boolean isTimeout() {
+     return System.currentTimeMillis() - lastHeartbeatTime > electionTimeout;
+ }
+private void resetElectionTimeout() {
+    // 8000ms ~ 12000ms 随机超时，避免平票
+    this.electionTimeout = 8000 + ThreadLocalRandom.current().nextInt(4000);
+    log.info("重置 {} 节点选举时间，随机超时：{} ms", nodeId, electionTimeout);
+    this.lastHeartbeatTime = System.currentTimeMillis();
+}
+```
 
+主要就是看becomeCandidate这个方法最后的向集群发送投票请求。
 
+```java
+private void requestVotes() {
+    // 1. 初始化票数：自己的一票
+    AtomicInteger grantedVotes = new AtomicInteger(1);
+    long count = rpcPeers.stream().filter(peer -> !peer.isSelf()).count(); // 不包含自己的结点数
+    int majority = (int) ((count + 1) / 2 + 1); // 总节点数(包含自己)的半数以上
 
+    // 2.构造投票消息
+    KvRaftProto.VoteRequest voteRequest = KvRaftProto.VoteRequest.newBuilder()
+        .setTerm(currentTerm.get())
+        .setCandidateId(nodeId)
+        .setLastLogIndex(logManager.getLastLogIndex())
+        .setLastLogTerm(logManager.getLastLogTerm())
+        .build();
+    // 3. 发送投票请求
+    // 构建一个对象，表示当前投票请求的状态
+    // String voteId = UUID.randomUUID().toString().replaceAll("-", "");
+    // 这里为什么可以用term？因为 Raft 规定，一个节点在一个 term 内只能投一张票。
+    // 所以，只要 term 匹配，这个响应就一定是针对你当前发起的这一轮选举的。
+    GlobalVoteManager.setVoteState(currentTerm.get(), new VoteState(nodeId, currentTerm.get(), majority));
 
+    int countSend = 0;
+    for (RpcPeer peer : rpcPeers) {
+        if (!peer.isSelf()) { // 不是自身结点，就发送投票请求
+            // send方法就很简单了，请读者自行查看
+            boolean send = peer.send(KvRaftProto.RaftKvMessage.newBuilder()
+                                     .setType(KvRaftProto.RaftKvMessage.MessageType.VOTE_REQUEST)
+                                     .setVoteRequest(voteRequest)
+                                     .build());
+            if ( send ) countSend++;
+        }
+    }
+    log.info("发送投票请求：{}，已发送给了 {} 个结点..", voteRequest, countSend);
+}
+```
 
+这样投票请求就发送出去了，此时结点是作为客户端发送给其他节点的，接下来的逻辑就是其他节点接收到voteRequest请求然后做逻辑处理，所以就要在server包下面去查看具体逻辑。
+
+```java
+// 在kv-core的server包下面的KvBusinessHandler.java
+// 1.如果是投票请求
+if ( raftKvMessage.getType() == KvRaftProto.RaftKvMessage.MessageType.VOTE_REQUEST) {
+    log.info("receive vote request.........");
+    KvRaftProto.VoteRequest voteRequest = raftKvMessage.getVoteRequest();
+    // 可以看到交给了node去处理
+    KvRaftProto.VoteResponse voteResponse = node.tackleVoteRequest(voteRequest);
+    ctx.writeAndFlush(KvRaftProto.RaftKvMessage.newBuilder()
+                      .setType(KvRaftProto.RaftKvMessage.MessageType.VOTE_RESPONSE)
+                      .setVoteResponse(voteResponse)
+                      .build());
+}
+
+// 又回到了RaftNode类了
+public KvRaftProto.VoteResponse tackleVoteRequest(KvRaftProto.VoteRequest voteRequest) {
+    // 比较任期
+    if (voteRequest.getTerm() < currentTerm.get()) {
+        log.info("{} 投票请求任期太小，拒绝投票", nodeId);
+        return buildVoteResponse(false, currentTerm.get());
+    }
+    if ( votedFor != null && !voteRequest.getCandidateId().equals(votedFor) ) {
+        log.info("{}已投给其他人，拒绝该投票请求", nodeId);
+        return buildVoteResponse(false, currentTerm.get());
+    }
+    // 再比较日志情况
+    if ( voteRequest.getLastLogIndex() >= logManager.getLastLogIndex() &&
+        voteRequest.getLastLogTerm() >= logManager.getLastLogTerm() ) {
+        log.info("{} 投票请求ok，赞成投票", nodeId);
+        currentTerm.set(voteRequest.getTerm()); // 更新自己的任期
+        votedFor = voteRequest.getCandidateId(); // 投票给该节点
+        return buildVoteResponse(true, voteRequest.getTerm());
+    }
+    log.info("{} 投票请求日志太旧，拒绝该投票请求", nodeId);
+    return buildVoteResponse(false, currentTerm.get());
+}
+```
+
+其他节点收到了拉票请求，会返回response给candidate结点，candidate结点是作为Client发送的拉票请求，收到的响应肯定是在客户端的处理器handler，接下来的逻辑就要在rpc包下面的RpcClientHandler去查看了：
+
+```java
+@Override
+protected void channelRead0(ChannelHandlerContext ctx, KvRaftProto.RaftKvMessage msg) {
+    // 2.VOTE_RESPONSE 投票请求回来的响应【投票请求是结点作为客户端发出的，应该在客户端的handler处理响应】
+    if (msg.getType() == KvRaftProto.RaftKvMessage.MessageType.VOTE_RESPONSE) {
+        log.info("receive vote response.........");
+        KvRaftProto.VoteResponse voteResponse = msg.getVoteResponse();
+        raftNode.tackleVoteResponse(voteResponse); // 又回到了RaftNode
+    }
+}
+
+// RaftNode.java
+// 投票结果处理,【投票请求是结点作为客户端发出的，要在客户端的handler处理响应】
+public synchronized void tackleVoteResponse(KvRaftProto.VoteResponse voteResponse) {
+    long term = voteResponse.getTerm();
+    // 2. 发现更高任期，立即降级并更新
+    // 1. 任期检查：对方比我大，我立即认输
+    if (term > currentTerm.get()) {
+        stepDown(term);
+        return;
+    }
+    // 2. 状态检查：如果我已经不是 Candidate 了（比如已经超时重选或收到心跳），忽略
+    if (state != NodeState.CANDIDATE) return;
+
+    // 3. 任期匹配检查：确保这是对“当前这一轮”选举的回复
+    // 如果收到的响应任期比当前小，说明是之前过期的选举回复，直接丢弃
+    if (term < currentTerm.get()) {
+        return;
+    }
+
+    // 4. 从全局管理器获取当前选举的投票状态
+    VoteState voteState = GlobalVoteManager.getVoteState(term);
+    if (voteState == null) {
+        log.error("未找到任期 {} 的投票记录状态", term);
+        return;
+    }
+
+    // 5. 如果对方投了赞成票
+    if (voteResponse.getVoteGranted()) {
+        // 增加票数（这里 AtomicInteger 在 VoteState 内部保证了线程安全，
+        // 但由于本方法加了 synchronized，其实双重保险）
+        int currentVotes = voteState.addVote();
+        int majority = voteState.getMajority();
+        log.info("赞成票，当前票数: {}/{}", currentVotes, nodesConfig.getNodeList().size());
+
+        // 6. 检查是否达到多数派
+        if (currentVotes >= majority) {
+            log.info("节点 {} 获得过半选票 ({})，准备晋升为 Leader", nodeId, currentVotes);
+            becomeLeader();
+        }
+    } else {
+        log.info("拒绝了我的投票请求");
+    }
+}
+private synchronized void becomeLeader() {
+    if (state != NodeState.CANDIDATE) return;
+    if (state == NodeState.LEADER) return;
+
+    this.state = NodeState.LEADER;
+    log.info("Node {} 赢得选举，即将成为 Leader, Term: {}", nodeId, currentTerm.get());
+    // 1. 清理上一任期的残留状态
+    this.votedFor = null;
+
+    // 2. 立即发送第一波心跳，宣示主权 (防止其他节点又超时)
+    sendHeartbeats();
+
+    // 3. 启动定时心跳任务 (比如每 2 秒一次)
+    if (heartbeatTask != null) heartbeatTask.cancel(true);
+    heartbeatTask = scheduler.scheduleAtFixedRate(this::sendHeartbeats,
+                                                  0, 1000, TimeUnit.MILLISECONDS);
+    log.info("<<<<< 节点 {} 正式成为 Term {} 的 Leader >>>>>", nodeId, currentTerm.get());
+}
+```
+
+# 3.启动测试选主
+
+把配置好的三个节点启动一下看看结果
+
+![](.\images\kv7.png)
+
+---
+
+![](.\images\kv8.png)
+
+---
+
+![](.\images\kv9.png)
+
+从上图可以看出，端口9999成为了Leader结点，然后向其他节点发送心跳数据了。
+
+接下来就是完善一下日志分发那些逻辑了。
 
 # end. 参考
 
